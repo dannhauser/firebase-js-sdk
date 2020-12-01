@@ -99,6 +99,21 @@ export function fieldTransformEquals(
   );
 }
 
+export function fieldTransformsAreEqual(
+  left?: FieldTransform[],
+  right?: FieldTransform[]
+): boolean {
+  if (left === undefined && right === undefined) {
+    return true;
+  }
+
+  if (!!left && !!right) {
+    return arrayEquals(left, right, (l, r) => fieldTransformEquals(l, r));
+  }
+
+  return false;
+}
+
 /** The result of successfully applying a mutation to the backend. */
 export class MutationResult {
   constructor(
@@ -127,7 +142,6 @@ export class MutationResult {
 export const enum MutationType {
   Set,
   Patch,
-  Transform,
   Delete,
   Verify
 }
@@ -252,6 +266,7 @@ export abstract class Mutation {
   abstract readonly type: MutationType;
   abstract readonly key: DocumentKey;
   abstract readonly precondition: Precondition;
+  abstract readonly fieldTransforms?: FieldTransform[];
 }
 
 /**
@@ -278,12 +293,6 @@ export function applyMutationToRemoteDocument(
     return applySetMutationToRemoteDocument(mutation, maybeDoc, mutationResult);
   } else if (mutation instanceof PatchMutation) {
     return applyPatchMutationToRemoteDocument(
-      mutation,
-      maybeDoc,
-      mutationResult
-    );
-  } else if (mutation instanceof TransformMutation) {
-    return applyTransformMutationToRemoteDocument(
       mutation,
       maybeDoc,
       mutationResult
@@ -326,11 +335,14 @@ export function applyMutationToLocalView(
   verifyMutationKeyMatches(mutation, maybeDoc);
 
   if (mutation instanceof SetMutation) {
-    return applySetMutationToLocalView(mutation, maybeDoc);
+    return applySetMutationToLocalView(
+      mutation,
+      maybeDoc,
+      localWriteTime,
+      baseDoc
+    );
   } else if (mutation instanceof PatchMutation) {
-    return applyPatchMutationToLocalView(mutation, maybeDoc);
-  } else if (mutation instanceof TransformMutation) {
-    return applyTransformMutationToLocalView(
+    return applyPatchMutationToLocalView(
       mutation,
       maybeDoc,
       localWriteTime,
@@ -345,31 +357,31 @@ export function applyMutationToLocalView(
   }
 }
 
-/**
- * If this mutation is not idempotent, returns the base value to persist with
- * this mutation. If a base value is returned, the mutation is always applied
- * to this base value, even if document has already been updated.
- *
- * The base value is a sparse object that consists of only the document
- * fields for which this mutation contains a non-idempotent transformation
- * (e.g. a numeric increment). The provided value guarantees consistent
- * behavior for non-idempotent transforms and allow us to return the same
- * latency-compensated value even if the backend has already applied the
- * mutation. The base value is null for idempotent mutations, as they can be
- * re-played even if the backend has already applied them.
- *
- * @returns a base value to store along with the mutation, or null for
- * idempotent mutations.
- */
-export function extractMutationBaseValue(
-  mutation: Mutation,
-  maybeDoc: MaybeDocument | null
-): ObjectValue | null {
-  if (mutation instanceof TransformMutation) {
-    return extractTransformMutationBaseValue(mutation, maybeDoc);
-  }
-  return null;
-}
+// /**
+//  * If this mutation is not idempotent, returns the base value to persist with
+//  * this mutation. If a base value is returned, the mutation is always applied
+//  * to this base value, even if document has already been updated.
+//  *
+//  * The base value is a sparse object that consists of only the document
+//  * fields for which this mutation contains a non-idempotent transformation
+//  * (e.g. a numeric increment). The provided value guarantees consistent
+//  * behavior for non-idempotent transforms and allow us to return the same
+//  * latency-compensated value even if the backend has already applied the
+//  * mutation. The base value is null for idempotent mutations, as they can be
+//  * re-played even if the backend has already applied them.
+//  *
+//  * @returns a base value to store along with the mutation, or null for
+//  * idempotent mutations.
+//  */
+// export function extractMutationBaseValue(
+//   mutation: Mutation,
+//   maybeDoc: MaybeDocument | null
+// ): ObjectValue | null {
+//   if (mutation instanceof TransformMutation) {
+//     return extractTransformMutationBaseValue(mutation, maybeDoc);
+//   }
+//   return null;
+// }
 
 export function mutationEquals(left: Mutation, right: Mutation): boolean {
   if (left.type !== right.type) {
@@ -385,7 +397,10 @@ export function mutationEquals(left: Mutation, right: Mutation): boolean {
   }
 
   if (left.type === MutationType.Set) {
-    return (left as SetMutation).value.isEqual((right as SetMutation).value);
+    return (
+      (left as SetMutation).value.isEqual((right as SetMutation).value) &&
+      fieldTransformsAreEqual(left.fieldTransforms, right.fieldTransforms)
+    );
   }
 
   if (left.type === MutationType.Patch) {
@@ -393,15 +408,8 @@ export function mutationEquals(left: Mutation, right: Mutation): boolean {
       (left as PatchMutation).data.isEqual((right as PatchMutation).data) &&
       (left as PatchMutation).fieldMask.isEqual(
         (right as PatchMutation).fieldMask
-      )
-    );
-  }
-
-  if (left.type === MutationType.Transform) {
-    return arrayEquals(
-      (left as TransformMutation).fieldTransforms,
-      (left as TransformMutation).fieldTransforms,
-      (l, r) => fieldTransformEquals(l, r)
+      ) &&
+      fieldTransformsAreEqual(left.fieldTransforms, right.fieldTransforms)
     );
   }
 
@@ -444,7 +452,8 @@ export class SetMutation extends Mutation {
   constructor(
     readonly key: DocumentKey,
     readonly value: ObjectValue,
-    readonly precondition: Precondition
+    readonly precondition: Precondition,
+    readonly fieldTransforms?: FieldTransform[]
   ) {
     super();
   }
@@ -457,29 +466,55 @@ function applySetMutationToRemoteDocument(
   maybeDoc: MaybeDocument | null,
   mutationResult: MutationResult
 ): Document {
-  debugAssert(
-    mutationResult.transformResults == null,
-    'Transform results received by SetMutation.'
-  );
-
   // Unlike applySetMutationToLocalView, if we're applying a mutation to a
   // remote document the server has accepted the mutation so the precondition
   // must have held.
-  return new Document(mutation.key, mutationResult.version, mutation.value, {
+  let newData = mutation.value;
+  if (mutation.fieldTransforms && mutationResult.transformResults) {
+    const transformResults = serverTransformResults(
+      mutation.fieldTransforms,
+      maybeDoc,
+      mutationResult.transformResults
+    );
+    newData = transformObject(
+      mutation.fieldTransforms,
+      newData,
+      transformResults
+    );
+  }
+
+  return new Document(mutation.key, mutationResult.version, newData, {
     hasCommittedMutations: true
   });
 }
 
 function applySetMutationToLocalView(
   mutation: SetMutation,
-  maybeDoc: MaybeDocument | null
+  maybeDoc: MaybeDocument | null,
+  localWriteTime: Timestamp,
+  baseDoc: MaybeDocument | null
 ): MaybeDocument | null {
   if (!preconditionIsValidForDocument(mutation.precondition, maybeDoc)) {
     return maybeDoc;
   }
 
+  let newData = mutation.value;
+  if (mutation.fieldTransforms) {
+    const transformResults = localTransformResults(
+      mutation.fieldTransforms,
+      localWriteTime,
+      maybeDoc,
+      baseDoc
+    );
+    newData = transformObject(
+      mutation.fieldTransforms,
+      newData,
+      transformResults
+    );
+  }
+
   const version = getPostMutationVersion(maybeDoc);
-  return new Document(mutation.key, version, mutation.value, {
+  return new Document(mutation.key, version, newData, {
     hasLocalMutations: true
   });
 }
@@ -502,7 +537,8 @@ export class PatchMutation extends Mutation {
     readonly key: DocumentKey,
     readonly data: ObjectValue,
     readonly fieldMask: FieldMask,
-    readonly precondition: Precondition
+    readonly precondition: Precondition,
+    readonly fieldTransforms?: FieldTransform[]
   ) {
     super();
   }
@@ -515,11 +551,6 @@ function applyPatchMutationToRemoteDocument(
   maybeDoc: MaybeDocument | null,
   mutationResult: MutationResult
 ): MaybeDocument {
-  debugAssert(
-    mutationResult.transformResults == null,
-    'Transform results received by PatchMutation.'
-  );
-
   if (!preconditionIsValidForDocument(mutation.precondition, maybeDoc)) {
     // Since the mutation was not rejected, we know that the  precondition
     // matched on the backend. We therefore must not have the expected version
@@ -528,7 +559,19 @@ function applyPatchMutationToRemoteDocument(
     return new UnknownDocument(mutation.key, mutationResult.version);
   }
 
-  const newData = patchDocument(mutation, maybeDoc);
+  let newData = patchDocument(mutation, maybeDoc);
+  if (mutation.fieldTransforms && mutationResult.transformResults) {
+    const transformResults = serverTransformResults(
+      mutation.fieldTransforms,
+      maybeDoc,
+      mutationResult.transformResults
+    );
+    newData = transformObject(
+      mutation.fieldTransforms,
+      newData,
+      transformResults
+    );
+  }
   return new Document(mutation.key, mutationResult.version, newData, {
     hasCommittedMutations: true
   });
@@ -536,14 +579,29 @@ function applyPatchMutationToRemoteDocument(
 
 function applyPatchMutationToLocalView(
   mutation: PatchMutation,
-  maybeDoc: MaybeDocument | null
+  maybeDoc: MaybeDocument | null,
+  localWriteTime: Timestamp,
+  baseDoc: MaybeDocument | null
 ): MaybeDocument | null {
   if (!preconditionIsValidForDocument(mutation.precondition, maybeDoc)) {
     return maybeDoc;
   }
 
   const version = getPostMutationVersion(maybeDoc);
-  const newData = patchDocument(mutation, maybeDoc);
+  let newData = patchDocument(mutation, maybeDoc);
+  if (mutation.fieldTransforms) {
+    const transformResults = localTransformResults(
+      mutation.fieldTransforms,
+      localWriteTime,
+      maybeDoc,
+      baseDoc
+    );
+    newData = transformObject(
+      mutation.fieldTransforms,
+      newData,
+      transformResults
+    );
+  }
   return new Document(mutation.key, version, newData, {
     hasLocalMutations: true
   });
@@ -580,115 +638,6 @@ function patchObject(mutation: PatchMutation, data: ObjectValue): ObjectValue {
     }
   });
   return builder.build();
-}
-
-/**
- * A mutation that modifies specific fields of the document with transform
- * operations. Currently the only supported transform is a server timestamp, but
- * IP Address, increment(n), etc. could be supported in the future.
- *
- * It is somewhat similar to a PatchMutation in that it patches specific fields
- * and has no effect when applied to a null or NoDocument (see comment on
- * Mutation for rationale).
- */
-export class TransformMutation extends Mutation {
-  readonly type: MutationType = MutationType.Transform;
-
-  // NOTE: We set a precondition of exists: true as a safety-check, since we
-  // always combine TransformMutations with a SetMutation or PatchMutation which
-  // (if successful) should end up with an existing document.
-  readonly precondition = Precondition.exists(true);
-
-  constructor(
-    readonly key: DocumentKey,
-    readonly fieldTransforms: FieldTransform[]
-  ) {
-    super();
-  }
-}
-
-function applyTransformMutationToRemoteDocument(
-  mutation: TransformMutation,
-  maybeDoc: MaybeDocument | null,
-  mutationResult: MutationResult
-): Document | UnknownDocument {
-  hardAssert(
-    mutationResult.transformResults != null,
-    'Transform results missing for TransformMutation.'
-  );
-
-  if (!preconditionIsValidForDocument(mutation.precondition, maybeDoc)) {
-    // Since the mutation was not rejected, we know that the  precondition
-    // matched on the backend. We therefore must not have the expected version
-    // of the document in our cache and return an UnknownDocument with the
-    // known updateTime.
-    return new UnknownDocument(mutation.key, mutationResult.version);
-  }
-
-  const doc = requireDocument(mutation, maybeDoc);
-  const transformResults = serverTransformResults(
-    mutation.fieldTransforms,
-    maybeDoc,
-    mutationResult.transformResults!
-  );
-
-  const version = mutationResult.version;
-  const newData = transformObject(mutation, doc.data(), transformResults);
-  return new Document(mutation.key, version, newData, {
-    hasCommittedMutations: true
-  });
-}
-
-function applyTransformMutationToLocalView(
-  mutation: TransformMutation,
-  maybeDoc: MaybeDocument | null,
-  localWriteTime: Timestamp,
-  baseDoc: MaybeDocument | null
-): MaybeDocument | null {
-  if (!preconditionIsValidForDocument(mutation.precondition, maybeDoc)) {
-    return maybeDoc;
-  }
-
-  const doc = requireDocument(mutation, maybeDoc);
-  const transformResults = localTransformResults(
-    mutation.fieldTransforms,
-    localWriteTime,
-    maybeDoc,
-    baseDoc
-  );
-  const newData = transformObject(mutation, doc.data(), transformResults);
-  return new Document(mutation.key, doc.version, newData, {
-    hasLocalMutations: true
-  });
-}
-
-function extractTransformMutationBaseValue(
-  mutation: TransformMutation,
-  maybeDoc: MaybeDocument | null | Document
-): ObjectValue | null {
-  let baseObject: ObjectValueBuilder | null = null;
-  for (const fieldTransform of mutation.fieldTransforms) {
-    const existingValue =
-      maybeDoc instanceof Document
-        ? maybeDoc.field(fieldTransform.field)
-        : undefined;
-    const coercedValue = computeTransformOperationBaseValue(
-      fieldTransform.transform,
-      existingValue || null
-    );
-
-    if (coercedValue != null) {
-      if (baseObject == null) {
-        baseObject = new ObjectValueBuilder().set(
-          fieldTransform.field,
-          coercedValue
-        );
-      } else {
-        baseObject = baseObject.set(fieldTransform.field, coercedValue);
-      }
-    }
-  }
-  return baseObject ? baseObject.build() : null;
 }
 
 /**
@@ -800,18 +749,18 @@ function localTransformResults(
 }
 
 function transformObject(
-  mutation: TransformMutation,
+  fieldTransforms: FieldTransform[],
   data: ObjectValue,
   transformResults: ProtoValue[]
 ): ObjectValue {
   debugAssert(
-    transformResults.length === mutation.fieldTransforms.length,
+    transformResults.length === fieldTransforms.length,
     'TransformResults length mismatch.'
   );
 
   const builder = new ObjectValueBuilder(data);
-  for (let i = 0; i < mutation.fieldTransforms.length; i++) {
-    const fieldTransform = mutation.fieldTransforms[i];
+  for (let i = 0; i < fieldTransforms.length; i++) {
+    const fieldTransform = fieldTransforms[i];
     builder.set(fieldTransform.field, transformResults[i]);
   }
   return builder.build();
@@ -819,7 +768,11 @@ function transformObject(
 
 /** A mutation that deletes the document at the given key. */
 export class DeleteMutation extends Mutation {
-  constructor(readonly key: DocumentKey, readonly precondition: Precondition) {
+  constructor(
+    readonly key: DocumentKey,
+    readonly precondition: Precondition,
+    readonly fieldTransforms?: FieldTransform[]
+  ) {
     super();
   }
 
@@ -870,6 +823,10 @@ function applyDeleteMutationToLocalView(
  * primarily to facilitate serialization into protos.
  */
 export class VerifyMutation extends Mutation {
+  // A VerifyMutation should not have a fieldTransform field. This field is
+  // here to satisfy the base class requirements.
+  readonly fieldTransforms: FieldTransform[] = [];
+
   constructor(readonly key: DocumentKey, readonly precondition: Precondition) {
     super();
   }

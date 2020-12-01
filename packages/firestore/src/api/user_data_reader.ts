@@ -17,13 +17,13 @@
 
 import {
   DocumentData,
-  SetOptions,
-  FieldPath as PublicFieldPath
+  FieldPath as PublicFieldPath,
+  SetOptions
 } from '@firebase/firestore-types';
 
 import {
-  Value as ProtoValue,
-  MapValue as ProtoMapValue
+  MapValue as ProtoMapValue,
+  Value as ProtoValue
 } from '../protos/firestore_proto_api';
 import { Timestamp } from './timestamp';
 import { DatabaseId } from '../core/database_info';
@@ -34,8 +34,7 @@ import {
   Mutation,
   PatchMutation,
   Precondition,
-  SetMutation,
-  TransformMutation
+  SetMutation
 } from '../model/mutation';
 import { FieldPath as InternalFieldPath } from '../model/path';
 import { debugAssert, fail } from '../util/assert';
@@ -83,13 +82,18 @@ export class ParsedSetData {
     const mutations = [] as Mutation[];
     if (this.fieldMask !== null) {
       mutations.push(
-        new PatchMutation(key, this.data, this.fieldMask, precondition)
+        new PatchMutation(
+          key,
+          this.data,
+          this.fieldMask,
+          precondition,
+          this.fieldTransforms
+        )
       );
     } else {
-      mutations.push(new SetMutation(key, this.data, precondition));
-    }
-    if (this.fieldTransforms.length > 0) {
-      mutations.push(new TransformMutation(key, this.fieldTransforms));
+      mutations.push(
+        new SetMutation(key, this.data, precondition, this.fieldTransforms)
+      );
     }
     return mutations;
   }
@@ -104,13 +108,15 @@ export class ParsedUpdateData {
   ) {}
 
   toMutations(key: DocumentKey, precondition: Precondition): Mutation[] {
-    const mutations = [
-      new PatchMutation(key, this.data, this.fieldMask, precondition)
+    return [
+      new PatchMutation(
+        key,
+        this.data,
+        this.fieldMask,
+        precondition,
+        this.fieldTransforms
+      )
     ] as Mutation[];
-    if (this.fieldTransforms.length > 0) {
-      mutations.push(new TransformMutation(key, this.fieldTransforms));
-    }
-    return mutations;
   }
 }
 

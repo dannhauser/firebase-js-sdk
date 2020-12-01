@@ -32,12 +32,7 @@ import {
 } from '../model/collections';
 import { MaybeDocument, NoDocument } from '../model/document';
 import { DocumentKey } from '../model/document_key';
-import {
-  extractMutationBaseValue,
-  Mutation,
-  PatchMutation,
-  Precondition
-} from '../model/mutation';
+import { Mutation, PatchMutation, Precondition } from '../model/mutation';
 import {
   BATCHID_UNKNOWN,
   MutationBatch,
@@ -373,38 +368,10 @@ export function localWrite(
         .getDocuments(txn, keys)
         .next(docs => {
           existingDocs = docs;
-
-          // For non-idempotent mutations (such as `FieldValue.increment()`),
-          // we record the base state in a separate patch mutation. This is
-          // later used to guarantee consistent values and prevents flicker
-          // even if the backend sends us an update that already includes our
-          // transform.
-          const baseMutations: Mutation[] = [];
-
-          for (const mutation of mutations) {
-            const baseValue = extractMutationBaseValue(
-              mutation,
-              existingDocs.get(mutation.key)
-            );
-            if (baseValue != null) {
-              // NOTE: The base state should only be applied if there's some
-              // existing document to override, so use a Precondition of
-              // exists=true
-              baseMutations.push(
-                new PatchMutation(
-                  mutation.key,
-                  baseValue,
-                  extractFieldMask(baseValue.proto.mapValue!),
-                  Precondition.exists(true)
-                )
-              );
-            }
-          }
-
           return localStoreImpl.mutationQueue.addMutationBatch(
             txn,
             localWriteTime,
-            baseMutations,
+            [],
             mutations
           );
         });
